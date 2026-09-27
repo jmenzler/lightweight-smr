@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>median-rule lab</title>
+<link rel="stylesheet" href="./lab.css" />
+</head>
+<body>
+<div class="app" id="app">
+  <div class="bar">
+    <div class="viewTabs">
+      <button class="vt on" data-view="replay">replay</button>
+      <button class="vt" data-view="charts">charts</button>
+      <button class="vt" data-view="run">run</button>
+      <button class="vt" data-view="smr">smr</button>
+    </div>
+    <button class="sumChip mono hidden" id="smrSumChip" title="session config — click to edit"></button>
+    <div class="meta mono" id="metaLine">no trace loaded</div>
+    <div class="chip chip-run" id="outcomeChip">–</div>
+    <div class="spacer"></div>
+    <a class="chip chip-run hostNote hidden" id="hostNote" href="https://github.com/jmenzler/lightweight-smr-blockchain#run-it-locally" target="_blank" rel="noopener" title="The hosted demo runs the simulator in this browser tab. Clone the repo and use the native sweep_grid binary for large parameter sweeps.">runs in your browser · clone the repo for large experiments</a>
+    <button class="btn" id="loadBtn">load trace.json</button>
+  </div>
+  <div class="split">
+    <div class="view on" id="view-replay">
+      <div class="canvasWrap">
+        <canvas class="net" id="net"></canvas>
+        <div class="dropHint" id="dropHint">drop trace.json to load</div>
+      </div>
+      <div class="liveCol hidden" id="liveCol">
+        <div class="liveVal mono" id="liveSliderVal">β 0%</div>
+        <input class="sliderV" type="range" id="liveSlider" min="0" max="60" value="0" />
+        <button class="btn btn-ico" id="livePlayBtn" title="play / pause live stepping">▶️</button>
+        <button class="btn btn-ico" id="liveStepBtn" title="step one round">▶</button>
+        <button class="btn" id="liveExportSpec" title="download replayable scenario json">spec</button>
+        <button class="btn" id="liveExportTrace" title="download trace json">trace</button>
+        <button class="btn" id="liveEndBtn" title="end live session (trace stays loaded)">✕</button>
+        <div class="liveRound mono" id="liveRound">r 0</div>
+      </div>
+    </div>
+    <div class="view" id="view-charts">
+      <div class="chartsWrap">
+        <div class="chartBox grow2">
+          <div class="tlHead"><span class="tlTitle">Value composition over rounds</span><span class="tlNote">bands = share per value · gray top = ⊥ · red strip = blocked · click to jump</span></div>
+          <div class="chartBody"><canvas class="tlCanvas" id="stacked"></canvas></div>
+        </div>
+        <div class="chartBox grow3">
+          <div class="tlHead"><span class="tlTitle">Per-node timeline</span><span class="tlNote" id="heatNote">rows = nodes (grouped by initial value) · red notch = blocked</span></div>
+          <div class="chartBody"><canvas class="tlCanvas" id="heat"></canvas></div>
+        </div>
+      </div>
+    </div>
+    <div class="view" id="view-run">
+      <div class="runWrap">
+        <div class="runForm">
+          <div class="ptitle">Start a run</div>
+          <div class="fSect">
+            <div class="fSectTitle">quick start — E2 acceptance regimes</div>
+            <div class="fBtns">
+              <button class="btn" id="presetA" title="Lemma 2.1: ⊥-start u₀=0.30, no blocking">A collapse</button>
+              <button class="btn" id="presetB" title="Lemma 2.2: ⊥-start u₀=5/9, 10% fresh blocking">B converge-hold</button>
+              <button class="btn" id="presetC" title="Lemma 2.3: all hold, 30% permanent blocking">C death spiral</button>
+            </div>
+            <div class="sHint">pre-registered thesis regimes (Lemmas 2.1 / 2.2 / 2.3) — fills the form below, then press run</div>
+          </div>
+          <div class="fSect">
+            <div class="fSectTitle">network</div>
+            <div class="fPair">
+              <div class="fCol"><span class="fMini">nodes n</span><input class="fInput" id="runN" type="number" min="10" max="200000" value="1000" /></div>
+              <div class="fCol"><span class="fMini">seed — same seed, same run</span><input class="fInput" id="runSeed" type="number" min="0" value="1" /></div>
+            </div>
+          </div>
+          <div class="fSect">
+            <div class="fSectTitle">protocol — (k,ℓ)-median rule</div>
+            <div class="fPair">
+              <div class="fCol"><span class="fMini">ask k random peers</span><input class="fInput" id="runK" type="number" min="2" value="6" /></div>
+              <div class="fCol"><span class="fMini">need ℓ replies (odd)</span><input class="fInput" id="runEll" type="number" min="3" step="2" value="3" /></div>
+            </div>
+            <div class="sHint">each round a node adopts the median of ≥ ℓ replies — with fewer it becomes ⊥ (undecided)</div>
+          </div>
+          <div class="fSect">
+            <div class="fSectTitle">initial values</div>
+            <div class="fPair">
+              <div class="fCol"><span class="fMini">useful fraction u₀ — the rest start ⊥ (as after a blocking partition)</span><input class="fInput" id="runUseful" type="number" min="0" max="1" step="any" value="1" /></div>
+            </div>
+            <div class="fCol"><span class="fMini">value distribution of the useful nodes</span>
+            <select class="fInput" id="runInit">
+              <option value="split">value split (worst case)</option>
+              <option value="even">even m-split (worst case, m colours)</option>
+              <option value="random">uniform random values</option>
+              <option value="weighted">weighted pmf (curve editor)</option>
+              <option value="distinct">all distinct</option>
+            </select>
+            </div>
+          <div class="fRow" id="rowSplitFrac"><span class="fLabel">split fraction</span><input class="fInput" id="runSplitFrac" type="number" min="0" max="1" step="any" value="0.5" /></div>
+          <div class="fRow hidden" id="rowRandK"><span class="fLabel" id="runRandKLabel">value count</span><input class="fInput" id="runRandK" type="number" min="1" value="4" /></div>
+          <div class="fRow hidden" id="rowPmf" style="align-items:flex-start">
+            <span class="fLabel">pmf</span>
+            <div style="flex:1;display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;flex-direction:column;gap:4px">
+                <span class="fMini">values R — how many distinct values the curve is spread over; small R = few shared colours, huge R = sparse ordered universe</span>
+                <input class="fInput" id="pmfRange" type="number" min="2" value="32" placeholder="e.g. 32, or 4294967296 for a sparse 2^32 space" />
+              </div>
+              <canvas id="pmfCanvas" style="display:block;width:100%;height:150px;border:1px solid #232932;border-radius:8px;background:#14181e;cursor:crosshair"></canvas>
+              <div class="hint" style="margin-left:0">drag points · double-click to add · right-click to remove · bars = normalized pmf</div>
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <button class="btn" id="pmfUniform">uniform</button>
+                <button class="btn" id="pmfZipf">zipf</button>
+                <button class="btn" id="pmfGeo">geometric</button>
+                <button class="btn" id="pmfBimodal">bimodal</button>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:4px">
+                <span class="fMini">custom w(i) formula — overrides curve &amp; presets while set</span>
+                <input class="fInput" id="pmfFormula" type="text" placeholder="1/(i+1)^2 · exp(-x*4) · i<3?1:0   (vars: i, m, x=i/(m-1))" />
+              </div>
+              <div style="display:flex;gap:6px;align-items:center">
+                <input class="fInput" id="pmfName" type="text" placeholder="preset name" style="flex:0 1 130px" />
+                <button class="btn" id="pmfSave">save</button>
+                <select class="fInput" id="pmfSaved" style="flex:0 1 120px"><option value="">saved…</option></select>
+                <button class="btn" id="pmfDelete">×</button>
+              </div>
+              <div class="hint mono" id="pmfOut" style="margin-left:0;color:#3dd6c4"></div>
+            </div>
+          </div>
+          </div>
+          <div class="fSect">
+            <div class="fSectTitle">blocking adversary β</div>
+            <div class="fPair">
+              <div class="fCol"><span class="fMini">schedule</span>
+                <select class="fInput" id="runSchedule">
+                  <option value="fresh_per_round">fresh — re-sampled every round</option>
+                  <option value="permanent">permanent — one fixed set</option>
+                </select>
+              </div>
+              <div class="fCol"><span class="fMini">blocked % of n</span><input class="fInput" id="runBeta" type="number" min="0" max="60" step="1" value="10" /></div>
+            </div>
+            <div class="sHint">blocked nodes send and receive nothing that round · fresh ≈ Lemma 2.2's adversary, permanent ≈ Lemma 2.3's · in live sticky mode this becomes never-stopping background noise under your slider</div>
+          </div>
+          <div class="fSect">
+            <div class="fSectTitle">run</div>
+            <div class="fPair">
+              <div class="fCol"><span class="fMini">max rounds</span><input class="fInput" id="runMax" type="number" min="1" max="5000" value="1000" /></div>
+              <div class="fCol"><span class="fMini">live slider mode</span>
+                <select class="fInput" id="liveMode" title="fresh: slider β re-sampled every round · sticky: slider drives a persistent targeted set, blocked % above adds background noise">
+                  <option value="fresh">β fresh / round</option>
+                  <option value="sticky">β sticky + background</option>
+                </select>
+              </div>
+            </div>
+            <div class="fBtns">
+              <button class="btn btn-go" id="runBtn">run ▶</button>
+              <button class="btn" id="liveBtn" title="start a live session — the vertical slider injects blocking round by round">live ▷</button>
+              <span style="flex:1"></span>
+              <button class="btn" id="exportSpecBtn" title="download this form as replayable scenario json">export json</button>
+              <button class="btn" id="importSpecBtn" title="load a scenario or trace json">import json</button>
+            </div>
+            <div class="runStatus mono" id="runStatus"></div>
+            <div class="chip chip-run engineChip" id="engineChip">engine: starting…</div>
+          </div>
+          <div class="fHint" style="margin-left:0">Rust simulator compiled to WASM — identical engine, RNG, and trace schema as the CLI, so seeds are canonical and reproducible: <span class="mono">cargo run --example trace -- out.json n seed beta</span> gives byte-identical traces. Targets (sample edges) are recorded only for n ≤ 2000 to bound trace size.</div>
+        </div>
+      </div>
+    </div>
+    <div class="view" id="view-smr">
+      <div class="smrCol">
+        <div class="ctl hidden" id="smrCtl">
+          <div class="grp">
+            <button class="btn btn-ico" id="smrPlayBtn" title="play / pause stepping">▶️</button>
+            <button class="btn btn-ico" id="smrStepBtn" title="step one round">▶</button>
+            <select class="sel" id="smrSpeed" title="steps per second">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+            </select>
+            <span class="roundLbl mono" id="smrLiveRound">r 0</span>
+            <button class="btn btn-ico recoveryOnly hidden" id="smrBoundaryBtn" title="run to the next window boundary — stops one row past it, where the boundary's effects land (rollbacks, forks, checkpoint latches). With T 40, single-round stepping is 39 dead clicks per event.">▶|</button>
+            <button class="btn btn-ico recoveryOnly hidden" id="smrEventBtn" title="run to the next event — rollback, first ⊥, checkpoint fork, or recovery confirmed — and stop there, naming what it found">⏭</button>
+          </div>
+          <div class="sep"></div>
+          <div class="betaWrap">
+            <span class="bv mono" id="smrSliderVal">β 0%</span>
+            <input type="range" class="betaH" id="smrSlider" min="0" max="60" value="0" title="β — fraction of servers blocked each round. In recovery mode this is the whole experiment: cranking it IS the surge, dropping it to 0 is the release — φ, r* and the law card all latch off that release." />
+          </div>
+          <div class="sep"></div>
+          <div class="pop" id="smrInjectPop">
+            <button class="btn popBtn" id="smrInjectPopBtn">inject</button>
+            <div class="popBody">
+              <span class="fMini">client</span><input class="fInput" id="smrInjClient" type="number" min="0" value="100" />
+              <span class="fMini">op</span><input class="fInput" id="smrInjOp" type="number" min="1" value="1000" />
+              <span class="fMini">target — empty = random (paper client)</span><input class="fInput" id="smrInjTarget" type="number" min="0" placeholder="random" />
+              <button class="btn btn-inject" id="smrInjectBtn">submit command ▷</button>
+            </div>
+          </div>
+          <div class="pop" id="smrTrafficPop">
+            <button class="btn popBtn" id="smrTrafficPopBtn">traffic</button>
+            <div class="popBody" style="min-width:250px">
+              <span class="fMini">engine pmf — applies from the next round, stays in the exported spec</span>
+              <select class="fInput" id="smrTraffic">
+                <option value="0">off (0 / round)</option>
+                <option value="0.25">1 command / 4 rounds (mixture)</option>
+                <option value="0.5">1 command / 2 rounds (mixture)</option>
+                <option value="1">1 command / round</option>
+                <option value="2">2 commands / round</option>
+                <option value="4">4 commands / round</option>
+              </select>
+              <button class="btn" id="smrTrafficApply">apply pmf ▷</button>
+            </div>
+          </div>
+          <button class="btn" id="smrExportSpecLive" title="replayable scenario json of the exact session">spec</button>
+          <button class="btn" id="smrEndBtn" title="end live session">✕</button>
+          <div class="sep recoveryOnly hidden"></div>
+          <div class="recChips recoveryOnly hidden" id="smrRecChips">
+            <span class="recChip mono" id="smrClockChip" title="WHY: everything in Alg 6 happens on the window clock — commits, checkpoints and rollbacks all land on boundaries. WHAT: the current window [a,b), its length T, and the rounds left to the next boundary. Once a release has been seen it also carries r* (the recovered round) and R = r* − release. DATA: recovery rows' window field plus the spec's T.">–</span>
+            <span class="recChip mono" id="smrPhaseChip" title="WHY: a recovery claim is only meaningful once the surge has actually ended — on a calm run there is nothing to recover from. WHAT: PROVISIONAL from the first release (β &gt; 0 → 0) until a clean converged suffix confirms it; CONFIRMED after. r* is suffix-universal — a relapse voids a provisional candidate, which is why the chip refuses to commit early. DATA: the recorded β track plus the same scan the engine's recovered_round uses.">–</span>
+            <span class="recChip mono" id="smrForkChip" title="WHY: two different checkpoints alive at the same window would break the whole construction (Lemma 6.5/6.7). WHAT: how many distinct (S, P) exist among the servers at the largest window — 1 is healthy, more flares. Blind spot: it is sampled at boundaries only, so it shows onset and ubiquity, not every transient. Run T just under the broadcast-time floor (T 4 at n 256) to watch it flare live. DATA: cp_fork_k, latched on the row after each boundary.">–</span>
+            <span class="recChip mono" id="smrLifeChip" title="WHY: 'done' means different things at different stages, exactly as in Solana's processed / confirmed / finalized — except here the clock drives it, not votes. WHAT: settled = reached every log, still revocable — a rollback discards it and the resend re-ages · ckpt = staged in the newest checkpoint's aged prefix, safe once that checkpoint spreads (the below-T_B cliff is exactly this tier failing) · final = §6-committed at a boundary, irreversible by monotonicity · ⟲ = rollbacks so far. DATA: command landmarks plus max_cp_p_len and the cumulative rollback count.">–</span>
+          </div>
+          <div class="spacer"></div>
+          <div class="ctlMetrics mono" id="smrCtlMetrics"></div>
+        </div>
+        <div class="lawCard hidden" id="smrLawCard"></div>
+        <div class="abortBanner hidden" id="smrAbort"></div>
+        <div class="smrStageWrap">
+          <div class="smrStage" id="smrStage">
+            <div class="smrFormCard" id="smrFormCard">
+              <div class="smrForm">
+                <div class="ptitle">Start an SMR run</div>
+                <div class="fSect">
+                  <div class="fSectTitle">protocol — Algorithm 3 / 5 / 6</div>
+                  <div class="protoToggle" id="smrProtoToggle">
+                    <button class="vt on" data-proto="extended">extended</button>
+                    <button class="vt" data-proto="compact">compact</button>
+                    <button class="vt" data-proto="recovery">recovery</button>
+                  </div>
+                  <div class="fCol compactOnly hidden" id="rowSmrT">
+                    <span class="fMini">commit T (rounds) — a command executes once aged T rounds; safety needs T &gt; T_B + max(T_B, T_M), so scale with log₂n (too-small T = live commitment errors, watch the safety flag)</span>
+                    <input class="fInput" id="smrT" type="number" min="1" value="24" />
+                  </div>
+                  <div class="fCol recoveryOnly hidden" id="rowSmrTw">
+                    <span class="fMini">window T (rounds) — the checkpoint clock: every T rounds the aged prefix is executed and a new checkpoint minted, or a reset-armed server rolls back to the last one. Below the broadcast-time floor T_B the system cannot re-converge at all (cliff preset)<span class="qHint" title="WHY: T is the single knob that decides whether a surged system ever comes back. WHAT: the length of one checkpoint window — commit clock and rollback granularity in one. DATA: spec proto.t_window_rounds; the clock chip reads it back from the run.">?</span></span>
+                    <input class="fInput" id="smrTw" type="number" min="1" value="40" />
+                  </div>
+                  <div class="fCol recoveryOnly hidden" id="rowSmrAck">
+                    <span class="fMini">§5 certificates (RQ11) — clients resend past commitment until a server acks, the only moment a commit notification can ride back<span class="qHint" title="WHY: §6 p. 30 claims the §5 certificate layer carries over to Alg 6 in one sentence and never constructs it; Theorem 6 is proved for the compact protocol only. This is the thesis's construction, not the paper's. WHAT: certificate state lives inside each checkpoint, so rollback restores it and adoption clones it with no new propagation path, and commands are attested only once a boundary has fully executed them (Lemma 6.9) — never while they sit revocable in P. Clients then run §5's client protocol verbatim (p. 25), resending until a contacted server acknowledges. DATA: certs_json over the servers' checkpoint-resident forests; off by default because the ack-tied client changes the client-stage draw pattern.">?</span></span>
+                    <div class="protoToggle" id="smrAckToggle">
+                      <button class="vt on" data-ack="off">off</button>
+                      <button class="vt" data-ack="on">certificates on</button>
+                    </div>
+                  </div>
+                  <div class="fCol recoveryOnly hidden" id="rowSmrPreset">
+                    <span class="fMini">scenario preset — prefills the form and programs the β slider; edit anything before starting<span class="qHint" title="WHY: the headline results need a specific stimulus shape, and hand-driving the slider is fiddly. WHAT: a form prefill plus a per-round β program that drives the slider for you — surge → release replays the release law's regime (full blackout ending inside a window), partial surge blocks 30% and heals without the spiral, cliff runs T below the broadcast-time floor until the engine aborts. DATA: pure JS — the run still records its actual per-round fractions, so the export replays exactly what happened.">?</span></span>
+                    <div class="protoToggle" id="smrPresetToggle">
+                      <button class="vt on" data-preset="custom">custom</button>
+                      <button class="vt" data-preset="surge">surge → release</button>
+                      <button class="vt" data-preset="partial">partial surge</button>
+                      <button class="vt" data-preset="cliff">cliff (T &lt; T_B)</button>
+                    </div>
+                  </div>
+                  <div class="sHint">extended keeps the full per-node log · compact executes committed commands on a shared state and forgets them · recovery adds checkpoints and rollback so a collapsed system can come back</div>
+                </div>
+                <div class="fSect">
+                  <div class="fSectTitle">network</div>
+                  <div class="fPair">
+                    <div class="fCol"><span class="fMini">nodes n</span><input class="fInput" id="smrN" type="number" min="4" max="200000" value="64" /></div>
+                    <div class="fCol"><span class="fMini">seed — same seed, same run</span><input class="fInput" id="smrSeed" type="number" min="0" value="1" /></div>
+                  </div>
+                  <div class="fPair">
+                    <div class="fCol"><span class="fMini">σ — amp = ⌈σ·log₂n⌉ appends</span><input class="fInput" id="smrSigma" type="number" min="0.1" step="0.1" value="1" /></div>
+                    <div class="fCol"><span class="fMini">max rounds</span><input class="fInput" id="smrMax" type="number" min="1" max="5000" value="200" /></div>
+                  </div>
+                </div>
+                <div class="fSect">
+                  <div class="fSectTitle">blocking adversary β</div>
+                  <div class="fPair">
+                    <div class="fCol"><span class="fMini">live slider mode</span>
+                      <select class="fInput" id="smrLiveMode">
+                        <option value="fresh">fresh — re-sampled every round</option>
+                        <option value="sticky">sticky + background</option>
+                      </select>
+                    </div>
+                    <div class="fCol"><span class="fMini">blocked % of n</span><input class="fInput" id="smrBeta" type="number" min="0" max="60" value="10" /></div>
+                  </div>
+                  <div class="sHint">batch runs block a fresh % each round · in live sticky mode this % becomes never-stopping background noise under the slider</div>
+                </div>
+                <div class="fSect">
+                  <div class="fSectTitle">injections — one per client</div>
+                  <div class="injHeadRow"><span>round</span><span>client</span><span>op</span><span>target</span><span></span></div>
+                  <div id="smrInjRows"></div>
+                  <div class="fBtns">
+                    <button class="btn" id="smrInjAdd">+ add injection</button>
+                  </div>
+                  <div class="sHint">pre-registered commands delivered from fixed rounds · target empty = random server per attempt (paper client) · a pinned id is a lab deviation — the audit shows what it hit</div>
+                  <input type="hidden" id="smrRound" value="2" />
+                </div>
+                <div class="fSect">
+                  <div class="fSectTitle">arrival traffic — engine pmf</div>
+                  <div class="fCol"><span class="fMini">commands arriving per round, drawn inside the seeded run — replayable from the exported spec</span>
+                    <select class="fInput" id="smrArrRate">
+                      <option value="">off</option>
+                      <option value="0.25">1 command / 4 rounds (mixture)</option>
+                      <option value="0.5">1 command / 2 rounds (mixture)</option>
+                      <option value="1">1 command / round</option>
+                      <option value="2">2 commands / round</option>
+                      <option value="4">4 commands / round</option>
+                      <option value="custom">custom curve…</option>
+                    </select>
+                  </div>
+                  <div class="fRow hidden" id="rowArr" style="align-items:flex-start">
+                    <span class="fLabel">arrivals</span>
+                    <div style="flex:1;display:flex;flex-direction:column;gap:8px">
+                      <div style="display:flex;flex-direction:column;gap:4px">
+                        <span class="fMini">max arrivals+1 — curve index i = probability of exactly i arrivals that round</span>
+                        <input class="fInput" id="arrRange" type="number" min="2" max="4096" value="9" />
+                      </div>
+                      <canvas id="arrCanvas" style="display:block;width:100%;height:150px;border:1px solid #232932;border-radius:8px;background:#14181e;cursor:crosshair"></canvas>
+                      <div class="hint" style="margin-left:0">drag points · double-click to add · right-click to remove · bars = normalized pmf over counts 0..R−1</div>
+                      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                        <button class="btn" id="arrUniform">uniform</button>
+                        <button class="btn" id="arrZipf">zipf</button>
+                        <button class="btn" id="arrGeo">geometric</button>
+                        <button class="btn" id="arrBimodal">bimodal</button>
+                      </div>
+                      <div style="display:flex;flex-direction:column;gap:4px">
+                        <span class="fMini">custom w(i) formula — overrides curve &amp; presets while set</span>
+                        <input class="fInput" id="arrFormula" type="text" placeholder="i==2?1:0 for a fixed rate 2   (vars: i, m, x=i/(m-1))" />
+                      </div>
+                      <div style="display:flex;gap:6px;align-items:center">
+                        <input class="fInput" id="arrName" type="text" placeholder="preset name" style="flex:0 1 130px" />
+                        <button class="btn" id="arrSave">save</button>
+                        <select class="fInput" id="arrSaved" style="flex:0 1 120px"><option value="">saved…</option></select>
+                        <button class="btn" id="arrDelete">×</button>
+                      </div>
+                      <div class="hint mono" id="arrOut" style="margin-left:0;color:#3dd6c4"></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="fSect">
+                  <div class="fSectTitle">run</div>
+                  <div class="fBtns">
+                    <button class="btn btn-go" id="smrRunBtn">run ▶</button>
+                    <button class="btn" id="smrLiveBtn" title="start a live stepped session">live ▷</button>
+                    <span style="flex:1"></span>
+                    <button class="btn" id="smrExportSpec" title="replayable scenario json (live: the exact session incl. injected commands)">spec</button>
+                    <button class="btn" id="smrExportReport" title="full report json (metrics + audit trails)">report</button>
+                  </div>
+                  <div class="runStatus mono" id="smrStatus"></div>
+                </div>
+              </div>
+            </div>
+            <section class="stageSect hidden" id="smrNetBox">
+              <div class="panelHead">
+                <span class="pTitle">Node overview</span>
+                <div class="chartTabs recoveryOnly hidden" id="smrGridTabs">
+                  <button class="ct on" data-grid="watched">watched</button>
+                  <button class="ct" data-grid="rstate">R-state</button>
+                </div>
+                <span class="qHint recoveryOnly hidden" title="WHY: whether a server will roll back at the next boundary is decided by R, and R is NOT readable off its log — a reset-armed server can still hold one. WHAT: teal = no-reset (safe) · amber = reset (will roll back) · grey = ⊥. Lines flash the peer that caused a change: teal = whose checkpoint was adopted, amber = whose reply cleared the reset. Pink ring = blocked by the schedule, dashed ring = blocked by you (⌖ — a surgical adversary instead of the slider's random one). The reset wave literally spreads by gossip; the flashes show the carriers. DATA: the r field on each node glance, plus the step payload's edge lists.">?</span>
+                <span class="pStat mono" id="smrNetNote"></span>
+                <div class="glyphs">
+                  <span class="g"><span class="gd watch"></span>watched</span>
+                  <span class="g"><span class="gd bot"></span>⊥</span>
+                  <span class="g"><span class="gd blk"></span>blocked</span>
+                  <span class="qHint" title="Each dot is a node. Colored = holds the watched command · gray = ⊥ · pink ring = blocked this round.">?</span>
+                </div>
+              </div>
+              <div class="netBody"><canvas id="smrNet"></canvas></div>
+              <div class="drillHint recoveryOnly hidden">click a node to pin it — its detail refreshes every round<span class="qHint" title="WHY: a rollback is invisible in aggregate counts; you have to watch ONE server lose its history and rebuild it. WHAT: the pinned server's R, log and executed lengths, its checkpoint window and |P|, and two hashes — its current executed sequence against the one its checkpoint holds, Lemma 6.7's identity check by eye. They diverge while it runs ahead and re-converge when a boundary commits or a rollback resets it. Time travel does not apply here: the engine keeps no per-node history, so this is live state only. DATA: node_detail, fetched on demand and re-fetched each round while pinned.">?</span></div>
+              <div class="drillPanel hidden" id="smrDrill"></div>
+            </section>
+            <section class="stageSect recoveryOnly hidden" id="smrBlocksBox">
+              <div class="panelHead">
+                <span class="pTitle">Committed sequence</span>
+                <span class="pStat mono" id="smrBlocksNote"></span>
+                <span class="qHint" title="WHY: under Alg 6 nothing commits between boundaries — throughput arrives in lumps, and a surge shows up as a run of empty ones followed by an oversized catch-up. WHAT: one block per window boundary, width proportional to how many entries executed there; slim slots are boundaries that committed nothing (⟲ = the boundary rolled back instead); DRAIN marks the first batch after a rollback — the re-aged backlog landing at once. Click a block to open its batch and see which commands landed in it; click a command to pin it on the charts. DATA: the jump in max_executed_len across consecutive post-boundary rows.">?</span>
+              </div>
+              <div class="blocksStrip" id="smrBlocks"></div>
+              <div class="batchDrawer hidden" id="smrBatchDrawer"></div>
+              <div class="ghostRow recoveryOnly hidden" id="smrGhostRow">
+                <b>Certificates hidden</b> — §5's certificate layer is defined for the compact rule, and its state
+                (forest roots, per-client windows) lives outside the (S, P, W) checkpoint a rollback restores, so it
+                would strand beside the replaced state. The committed sequence itself never un-executes, which is what
+                makes the forest below well-defined; the adapted certificate construction is an open question, not an
+                omission.
+              </div>
+            </section>
+            <section class="stageSect hidden" id="smrTimelineBox">
+              <div class="panelHead">
+                <span class="pTitle">Master timeline</span>
+                <span class="pStat mono">β · windows · R-states · client queue · spread γ · prefix</span>
+                <span class="qHint" title="WHY: the recovery story is a chain — a surge (β) drives servers to ⊥ and reset (R), which stalls the client queue, which shows up as collapsed spread and prefix. Reading it needs one shared clock. WHAT: six lanes, one x-axis, gridlines every T; ⟲ badges mark rollbacks with their depth at the boundary they belong to. Hover for every lane's value at that round; click to park the cursor. Reading it: the reset wave's width IS R; the backlog cliff and the DRAIN block below are the same event in two views; post-rollback resends re-enter as fresh steep γ curves; prefix snap-backs sit right under the ⟲ badges that cause them. DATA: the streamed report — recovery rows, metrics and command landmarks; the queue is derived from injection and §6-commit rounds.">?</span>
+              </div>
+              <canvas id="smrTimeline"></canvas>
+            </section>
+            <section class="stageSect" id="smrSpreadBox">
+              <div class="panelHead">
+                <div class="chartTabs" id="smrChartTabs">
+                  <button class="ct on" data-chart="spread">spread</button>
+                  <button class="ct" data-chart="position">position</button>
+                </div>
+                <span class="pTitle">Command spread — γₜ</span>
+                <div class="glyphs">
+                  <span class="qHint" title="SPREAD: γₜ useful-holder fraction per command · dot = delivered · B/E ticks = T_B / T_E · flag = compact ack · dashed = 1/3 · amber = live round · older commands ghost. POSITION: selected command's min/median/max log position — the band collapses at T_E. Click an audit row to pin a command.">?</span>
+                </div>
+              </div>
+              <div class="tlCanvasWrap"><canvas id="smrSpread"></canvas></div>
+            </section>
+            <section class="stageSect" id="smrPrefixBox">
+              <div class="panelHead">
+                <span class="pTitle">Prefix agreement</span>
+                <span class="qHint" title="Per round: longest agreed sequence prefix ÷ longest sequence (extended: log LCP / max log; compact: shortest executed / longest executed — executed sequences are prefix-consistent). Full-height teal = full agreement.">?</span>
+                <div class="glyphs"><span class="pStat mono" id="smrLcpStat"></span></div>
+              </div>
+              <canvas id="smrPrefix"></canvas>
+            </section>
+            <section class="stageSect hidden" id="spillPanel">
+              <div class="panelHead">
+                <span class="pTitle">Canonical spill — a lean run's committed history</span>
+                <span class="badge badge-mut" id="spillTrust">—</span>
+                <button class="vBtn" id="spillCloseBtn" title="close the spill and return the panels to the live session">close</button>
+                <div class="glyphs">
+                  <span class="qHint" title="WHY: a lean recovery run has its servers forget their committed prefix — that is the whole point, and it is what takes a big dispatch from ~15 GB to single-digit GB. Nothing in the run then holds the committed history any more, so the chain panel below cannot be fed from a server. The spill is the one canonical record of that history: the committed stream, plus every server's forget offset and executed length at every T-window boundary. WHAT: pick a boundary and a server; the chain panel renders that server's committed view, reconstructed from the stream and checked against the digest chain the run itself recorded — not trusted. Parse, reconstruction and verification all happen in the same Rust reader the run's own diagnosis path uses; the browser only reads the file and draws. DATA: .runs/spills/*.jsonl, written once per boundary by the observer just before the servers forget.">?</span>
+                </div>
+              </div>
+              <div class="spillBody">
+                <div class="spillRow">
+                  <span class="fMini">boundary</span>
+                  <button class="btn btn-ico" id="spillPrevBtn" title="previous T-window boundary">◀</button>
+                  <button class="btn btn-ico" id="spillNextBtn" title="next T-window boundary">▶</button>
+                  <input type="range" class="betaH" id="spillScrub" min="0" max="0" value="0" title="T-window boundary — a spill records boundaries, not the rounds between them" />
+                  <span class="fMini">server</span>
+                  <select class="fInput" id="spillNode"></select>
+                </div>
+                <div class="pStat mono" id="spillProv"></div>
+                <div class="pStat mono" id="spillWhere"></div>
+                <div class="pStat mono" id="spillLens"></div>
+                <div class="pStat mono" id="spillChainNote"></div>
+                <div class="fMini">Not reconstructable from a spill:</div>
+                <ul class="spillAbsent" id="spillAbsent"></ul>
+              </div>
+            </section>
+            <section class="stageSect chainPanel hidden" id="chainPanel">
+              <div class="panelHead">
+                <span class="pTitle" id="chainTitle">Committed sequence — §5 Merkle forest</span>
+                <span class="badge badge-mut mono" id="certM">m = 0</span>
+                <span class="badge badge-mut mono" id="certBin">0</span>
+                <span class="badge badge-mut mono" id="certTrees">trees 0</span>
+                <span class="badge badge-ok" id="certRoots">roots ✓</span>
+                <button class="vBtn" id="certVerifyBtn" title="Verify every issued certificate against every server's forest (Thm 6): tally = accepted/covered, stamped with the round it was computed at. On demand — re-click to refresh.">verify everywhere</button>
+                <div class="glyphs">
+                  <span class="pStat mono" id="certVerStamp"></span>
+                  <span class="pStat mono" id="certSrv"></span>
+                  <span class="qHint" id="chainCertHint" title="Blocks = committed commands (newest right, dashed slot = next commit). The Merkle forest hangs from the blocks — scroll to follow it; a client row click highlights its tree path. Large m switches to the skyline (one bar per bit of m).">?</span>
+                  <span class="qHint hidden" id="chainRecHint" title="WHY: Alg 6 commits in lumps at window boundaries, and what it commits is a real sequence with real hashes — the blockchain the protocol actually builds. Watching it grow makes &quot;committed&quot; concrete, and the merge cascade shows a whole batch being absorbed at once. WHAT: one block per committed entry (newest right, dashed slot = the next commit), labelled with the command occupying it; the trees hanging below are the Merkle forest over those blocks — heights, ranges and root hashes come from the engine, no interior hash is invented. A boundary commit flashes the carry chain as equal-height trees merge; past 2^7 leaves the forest gives way to the skyline (one bar per bit of m). Click a block to pin its command on the charts. Empty stretches are honest: nothing commits between boundaries. DATA: chain_json over the canonical committed sequence — the longest executed prefix in the population, which never shrinks (Lemma 6.9). This is structure only: §5's certificate layer is not constructed for Alg 6.">?</span>
+                </div>
+              </div>
+              <div class="forestBody">
+                <div class="forestScroll" id="forestScroll">
+                  <svg id="forestSvg"></svg>
+                  <div class="sky hidden" id="certSky"></div>
+                  <div class="skyDetail hidden" id="certDetail"><span>no commits yet</span></div>
+                </div>
+                <div class="certsCol" id="certClients"></div>
+              </div>
+            </section>
+            <div class="runStatus mono" id="smrStrip">–</div>
+          </div>
+          <aside class="audit closed" id="smrAuditCol">
+            <div class="auditClosed" id="auditClosedTag">
+              <span class="auditTag">AUDIT</span>
+              <span class="auditCnt mono" id="auditCnt">0</span>
+            </div>
+            <div class="auditOpen hidden" id="auditOpenWrap">
+              <div class="auditHead2">
+                <span class="ptitle" style="margin-bottom:0;flex:1">Audit trail <span class="qHint" title="Per-command lifecycle — delivery attempts, amplification, landmarks and final status. Click a row to pin it on the charts and expand its trail.">?</span></span>
+                <select class="sel" id="smrAuditScope" title="how many commands to list">
+                  <option value="12" selected>last 12</option>
+                  <option value="50">last 50</option>
+                  <option value="all">all</option>
+                </select>
+                <button class="btn btn-ico" id="auditCollapse" title="collapse">»</button>
+              </div>
+              <div id="smrAudit" class="auditList"><div class="hint">no commands yet</div></div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </div>
+    <div class="side">
+      <div class="panel">
+        <div class="ptitle">Round</div>
+        <div class="row"><span class="rk">position</span><span class="rv mono" id="roundLabel">–</span></div>
+        <div class="row"><span class="rk">value holders</span><span class="rv mono" id="holdersLabel">–</span></div>
+        <div class="row"><span class="rk">undecided ⊥</span><span class="rv mono" id="botCount">–</span></div>
+        <div class="row"><span class="rk">blocked</span><span class="rv mono" id="blockedCount">–</span></div>
+        <div class="row"><span class="rk">distinct values</span><span class="rv mono" id="distinctCount">–</span></div>
+      </div>
+      <div class="panel">
+        <div class="ptitle">Value-holder fraction</div>
+        <canvas class="spark" id="spark"></canvas>
+      </div>
+      <div class="panel">
+        <div class="ptitle">Values</div>
+        <div id="legend"></div>
+      </div>
+      <div class="panel hidden" id="inspector">
+        <div class="ptitle">Node inspector</div>
+        <div class="row"><span class="rk">node</span><span class="rv mono" id="selId"></span></div>
+        <div class="row"><span class="rk">state</span><span class="rv mono" id="selState"></span></div>
+        <div class="row"><span class="rk">blocked this round</span><span class="rv mono" id="selBlocked"></span></div>
+        <div class="row"><span class="rk" style="color:#269c86">sampled →</span><span class="rv mono" id="selTargets"></span></div>
+        <div class="row"><span class="rk" style="color:#c05a9e">sampled by ←</span><span class="rv mono" id="selSamplers"></span></div>
+        <div class="hint">click empty space to deselect</div>
+      </div>
+      <div class="panel">
+        <div class="ptitle">Reading this view</div>
+        <div class="hint">Each dot is a node, colored by its current value (colors repeat past 7 values — a distinct init reads as noise early; order emerging IS the protocol working). Gray = ⊥. Red ring = blocked. Click a node for its sample edges (teal out, magenta in). Keys: ← → step, space = play. Click any chart to jump.</div>
+      </div>
+    </div>
+  </div>
+  <div class="transport" id="transport">
+    <button class="btn btn-ico" id="toStart">⏮</button>
+    <button class="btn btn-ico" id="stepBack">◀</button>
+    <button class="btn btn-ico" id="playBtn">▶️</button>
+    <button class="btn btn-ico" id="stepFwd">▶</button>
+    <button class="btn btn-ico" id="toEnd">⏭</button>
+    <input class="slider" type="range" id="scrub" min="0" max="1" value="0" />
+    <span class="mono meta" id="roundLabel2">–</span>
+    <select class="sel" id="speed">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+    </select>
+    <select class="sel" id="edgeMode">
+      <option value="selected" selected>edges: selected</option>
+      <option value="all">edges: all</option>
+      <option value="none">edges: none</option>
+    </select>
+  </div>
+</div>
+<div class="tlTip" id="tip"></div>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

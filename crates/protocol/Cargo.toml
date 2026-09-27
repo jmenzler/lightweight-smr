@@ -1,0 +1,19 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = { workspace = true }
+sha2 = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+
+[dev-dependencies]
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rstest = { workspace = true }
+serde_json = "1"
+bincode = "1"

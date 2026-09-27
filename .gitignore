@@ -1,0 +1,12 @@
+/target
+crates/sim-wasm/pkg
+.DS_Store
+.runs
+/out
+*.partial
+__pycache__/
+# mid-run progress sidecars: nondeterministic run-id keys.
+# The .tmp is the atomic-rename staging file, left behind only by a kill
+# inside the write.
+*.csv.progress.json
+*.csv.progress.tmp

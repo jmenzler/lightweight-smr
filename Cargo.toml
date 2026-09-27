@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/sim", "crates/sim-wasm", "crates/network-node"]
+
+[workspace.dependencies]
+rand_core = "0.9"
+rand = { version = "0.9", default-features = false, features = ["std", "alloc"] }
+rand_chacha = "0.9"
+rstest = "0.25"
+rayon = "1"
+sha2 = "0.10"
+
+[profile.test]
+opt-level = 2

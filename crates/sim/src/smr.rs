@@ -1,0 +1,786 @@
+//! SMR drivers: round loops for the extended, compact and recovery engines.
+//!
+//! `engine` is the simulated world (RNG draws, node steps), `observe` the read-only
+//! measurement over it. `tracker` is both: a command tracker holds the client's retry state
+//! that stage (b) reads and the landmarks the observation pass writes.
+
+mod engine;
+mod observe;
+mod tracker;
+mod types;
+mod validate;
+
+pub use crate::runlog::{run_smr_logged, run_smr_recorded};
+pub use engine::engine_rec::boundary_key_counts;
+pub use observe::accounting::Accounting;
+pub use observe::census_count::census_counts;
+pub use observe::detail::RecNodeDetail;
+pub use observe::log_index::holder_vec_count;
+pub use observe::safety::{EntrySeq, PrefixChecker, prefixes_consistent};
+pub use observe::spill::{Spill, SpillBoundary, SpillHeader, SpillTrailer, read_spill};
+pub use tracker::injection_sns;
+pub use types::{
+    AUTO_CLIENT_BASE, AUTO_OP_BASE, AttemptOutcome, ClientModel, CommandReport, CommandStatus,
+    DeliveryAttempt, Injection, ManualBlock, MergePolicy, NodeGlance, PrefixMismatch, Proto,
+    RecRoundMetrics, RecStepInfo, RecoveryFailure, RecoveryFailurePhase, RecoveryReport,
+    RepeatedCommit, SEED_COMMAND, SmrReport, SmrRoundMetrics, SmrScenario, SmrStepStatus,
+    SmrTerminal, SpreadCurve, SpreadPoint, SpreadingCommand, TrafficPhase, active_phase, amp_count,
+    auto_command,
+};
+pub(crate) use types::{PrefixMismatchWire, RepeatedCommitWire, is_abort, is_execute};
+pub use validate::point_mass_pmf;
+pub(crate) use validate::validate_weights;
+
+use crate::blocking::{
+    adjust_sticky_mask, compile_blocking, fraction_count, round_mask, sample_blocked,
+    sticky_with_background,
+};
+use crate::{Config, same_component};
+use engine::engine_rec::RecRunState;
+use engine::pool::ClientPool;
+use observe::boundary_skip::BoundarySkipTally;
+use observe::entry_index::EntryIndex;
+use observe::exec_dup::ExecDupOracle;
+use protocol::LogNode;
+use protocol::certificates::ServerCertState;
+use protocol::compact::{ClientCommand, CompactNode, Entry};
+use protocol::recovery::RecoveryNode;
+use protocol::shared_state::ExecSeq;
+use rand::SeedableRng;
+use rand_chacha::ChaCha12Rng;
+use tracker::{CommandTracker, trackers_for};
+use validate::{validate_injection, validate_pmf};
+
+fn par_step_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SIM_PAR_STEP").as_deref() == Ok("on"))
+}
+
+fn census_forced_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SIM_CENSUS").as_deref() == Ok("on"))
+}
+
+/// Run an SMR scenario to its horizon; panics on an invalid scenario or a violated invariant.
+pub fn run_smr(scenario: &SmrScenario) -> SmrReport {
+    run_smr_inner(scenario, RunScope::full())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RunScope {
+    lean: bool,
+    observe_spread: bool,
+}
+
+impl RunScope {
+    fn full() -> Self {
+        RunScope {
+            lean: false,
+            observe_spread: true,
+        }
+    }
+
+    fn lean() -> Self {
+        RunScope {
+            lean: true,
+            observe_spread: true,
+        }
+    }
+
+    fn grid() -> Self {
+        RunScope {
+            lean: true,
+            observe_spread: census_forced_on(),
+        }
+    }
+}
+
+/// As [`run_smr`], but releases settled spread curves and forgets committed prefixes.
+pub fn run_smr_lean(scenario: &SmrScenario) -> SmrReport {
+    run_smr_inner(scenario, RunScope::lean())
+}
+
+/// The grid's runner: lean, with the position census scoped out.
+pub fn run_smr_grid(scenario: &SmrScenario) -> SmrReport {
+    run_smr_inner(scenario, RunScope::grid())
+}
+
+pub fn grid_observes_census() -> bool {
+    census_forced_on()
+}
+
+/// [`run_smr_grid`] with the live state after every round.
+pub fn run_smr_grid_observed(
+    scenario: &SmrScenario,
+    observe: &mut dyn FnMut(&SmrState),
+) -> SmrReport {
+    run_smr_sampled(scenario, RunScope::grid(), observe)
+}
+
+/// Whether [`run_smr_lean`] has the servers forget their committed prefix.
+pub const LEAN_FORGETS_HISTORY: bool = true;
+
+/// [`run_smr_lean`] with the live state after every round; the observer only reads.
+pub fn run_smr_lean_observed(
+    scenario: &SmrScenario,
+    observe: &mut dyn FnMut(&SmrState),
+) -> SmrReport {
+    run_smr_sampled(scenario, RunScope::lean(), observe)
+}
+
+/// [`run_smr`] with the live state after every round.
+pub fn run_smr_observed(scenario: &SmrScenario, observe: &mut dyn FnMut(&SmrState)) -> SmrReport {
+    run_smr_sampled(scenario, RunScope::full(), observe)
+}
+
+fn run_smr_inner(scenario: &SmrScenario, scope: RunScope) -> SmrReport {
+    run_smr_sampled(scenario, scope, &mut |_: &SmrState| {})
+}
+
+fn run_smr_sampled(
+    scenario: &SmrScenario,
+    scope: RunScope,
+    observe: &mut dyn FnMut(&SmrState),
+) -> SmrReport {
+    scenario.validate().expect("invalid SmrScenario");
+    let mut state = SmrState::new_with_certs(
+        scenario.n,
+        scenario.cfg,
+        scenario.proto,
+        scenario.sigma,
+        scenario.seed,
+        &scenario.injections,
+        scenario.traffic.as_deref().unwrap_or(&[]),
+        scenario.client_model,
+        scenario.partition.as_deref(),
+        scenario.certs,
+        scenario.merge_policy,
+        scenario.repeated_commit,
+    );
+    state.drop_settled_spread = scope.lean;
+    state.truncate_history = scope.lean;
+    state.observe_spread = scope.observe_spread;
+    let blocking = compile_blocking(&scenario.schedule, scenario.n, state.rng_mut());
+    let mut sticky_mask = vec![false; scenario.n];
+    let progress = crate::progress::cell(scenario.n, scenario.seed, scenario.max_rounds);
+    for round in 1..=scenario.max_rounds {
+        progress.tick(round);
+        state.draw_arrivals();
+        let mut mask = round_mask(
+            &blocking,
+            round,
+            &mut sticky_mask,
+            scenario.n,
+            state.rng_mut(),
+        );
+        for mb in &scenario.manual_blocks {
+            if mb.covers(round) {
+                mask[mb.node as usize] = true;
+            }
+        }
+        let status = state.step_masked(&mask);
+        if status.failed() {
+            break;
+        }
+        observe(&state);
+        if status.dead.is_some() {
+            break;
+        }
+        if scenario.halt_on_violation && !state.safety_ok() {
+            break;
+        }
+    }
+    progress.done();
+    if state.failure.is_none() {
+        state.finish_spill();
+    }
+    state.report()
+}
+
+enum SmrNodes {
+    Ext(Vec<LogNode>),
+    Comp(Vec<CompactNode>),
+    Rec(Vec<RecoveryNode>),
+}
+
+/// Incremental SMR stepping core; stage order is the RNG contract (sim/smr-driver-architecture.md).
+pub struct SmrState {
+    n: usize,
+    seed: u64,
+    cfg: Config,
+    amp: usize,
+    rng: ChaCha12Rng,
+    nodes: SmrNodes,
+    trackers: Vec<CommandTracker>,
+    client_order: Vec<usize>,
+    metrics: Vec<SmrRoundMetrics>,
+    round: usize,
+    dead: Option<usize>,
+    failure: Option<RecoveryFailure>,
+    failed_status: Option<SmrStepStatus>,
+    safety_ok: bool,
+    checker: PrefixChecker,
+    exec_dup: ExecDupOracle,
+    /// Entries the execute-once state machine left out, over all nodes, and the first such round.
+    repeat_skips: u64,
+    first_repeat_skip_round: Option<usize>,
+    boundary_skips: BoundarySkipTally,
+    canon_index: EntryIndex,
+    inert_prefix: usize,
+    nulls_possible: bool,
+    pub(crate) drop_settled_spread: bool,
+    pub(crate) truncate_history: bool,
+    pub(crate) observe_spread: bool,
+    frontier: u64,
+    release_line: u64,
+    spill: Option<observe::spill::SpillWriter>,
+    spill_allowed: bool,
+    traffic: Vec<TrafficPhase>,
+    pool: Option<ClientPool>,
+    auto_spawned: u64,
+    arrivals_drawn_for: Option<usize>,
+    arrivals_pending: u32,
+    rec: Option<RecRunState>,
+    #[cfg(test)]
+    rec_boundary_snapshot: Option<Vec<engine::engine_rec::RecBoundaryNodeSnapshot>>,
+    partition: Option<Vec<u32>>,
+}
+
+impl SmrState {
+    /// Draws nothing after seeding: node constructors are RNG-free.
+    // Every parameter explicit: a driver must name its client model and partition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        n: usize,
+        cfg: Config,
+        proto: Proto,
+        sigma: f64,
+        seed: u64,
+        injections: &[Injection],
+        traffic: &[TrafficPhase],
+        client_model: ClientModel,
+        partition: Option<&[u32]>,
+    ) -> SmrState {
+        SmrState::new_with_certs(
+            n,
+            cfg,
+            proto,
+            sigma,
+            seed,
+            injections,
+            traffic,
+            client_model,
+            partition,
+            false,
+            MergePolicy::default(),
+            RepeatedCommit::Execute,
+        )
+    }
+
+    /// As [`SmrState::new`], mounting the §5 certificate layer on recovery nodes when `certs` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_certs(
+        n: usize,
+        cfg: Config,
+        proto: Proto,
+        sigma: f64,
+        seed: u64,
+        injections: &[Injection],
+        traffic: &[TrafficPhase],
+        client_model: ClientModel,
+        partition: Option<&[u32]>,
+        certs: bool,
+        merge_policy: MergePolicy,
+        repeated_commit: RepeatedCommit,
+    ) -> SmrState {
+        crate::check_partition(partition, n).expect("invalid partition");
+        let rng = ChaCha12Rng::seed_from_u64(seed);
+        let mut rec = None;
+        let nodes = match proto {
+            Proto::Extended => {
+                SmrNodes::Ext((0..n).map(|_| LogNode::new(SEED_COMMAND, cfg)).collect())
+            }
+            Proto::Compact { t_commit_rounds } => SmrNodes::Comp(
+                (0..n)
+                    .map(|_| {
+                        CompactNode::new(cfg, t_commit_rounds)
+                            .with_merge_policy(merge_policy.stamp_tie, merge_policy.union_stamp)
+                            .with_repeated_commit(repeated_commit)
+                    })
+                    .collect(),
+            ),
+            Proto::Recovery {
+                t_window_rounds,
+                resend_until_acked,
+                prefix_mismatch,
+            } => {
+                rec = Some(RecRunState::new(
+                    t_window_rounds,
+                    n,
+                    resend_until_acked,
+                    prefix_mismatch,
+                ));
+                SmrNodes::Rec(
+                    (0..n)
+                        .map(|_| {
+                            RecoveryNode::new(cfg, t_window_rounds, certs)
+                                .with_merge_policy(merge_policy.stamp_tie, merge_policy.union_stamp)
+                                .with_prefix_mismatch(prefix_mismatch)
+                                .with_repeated_commit(repeated_commit)
+                        })
+                        .collect(),
+                )
+            }
+        };
+        let (trackers, client_order) = trackers_for(injections);
+        let nulls_possible = tracker::nulls_reachable(&trackers);
+        SmrState {
+            n,
+            seed,
+            cfg,
+            amp: amp_count(sigma, n),
+            rng,
+            nodes,
+            trackers,
+            client_order,
+            metrics: Vec::new(),
+            round: 0,
+            dead: None,
+            failure: None,
+            failed_status: None,
+            safety_ok: true,
+            checker: PrefixChecker::new(n),
+            exec_dup: ExecDupOracle::new(n),
+            repeat_skips: 0,
+            first_repeat_skip_round: None,
+            boundary_skips: BoundarySkipTally::new(n),
+            canon_index: EntryIndex::new(),
+            inert_prefix: 0,
+            nulls_possible,
+            drop_settled_spread: false,
+            truncate_history: false,
+            observe_spread: true,
+            frontier: 0,
+            release_line: 0,
+            spill: None,
+            spill_allowed: matches!(proto, Proto::Recovery { .. })
+                && observe::spill::spill_enabled(),
+            traffic: traffic.to_vec(),
+            pool: client_model.pool_size().map(ClientPool::new),
+            auto_spawned: 0,
+            arrivals_drawn_for: None,
+            arrivals_pending: 0,
+            rec,
+            #[cfg(test)]
+            rec_boundary_snapshot: None,
+            partition: partition.map(<[u32]>::to_vec),
+        }
+    }
+
+    /// Stage (a0): exactly one weighted arrival draw per round, before any mask draw.
+    pub fn draw_arrivals(&mut self) {
+        self.assert_not_failed("draw arrivals");
+        let round = self.round + 1;
+        assert!(
+            self.arrivals_drawn_for != Some(round),
+            "draw_arrivals called twice for round {round}"
+        );
+        self.arrivals_drawn_for = Some(round);
+        let Some(phase) = active_phase(&self.traffic, round) else {
+            return;
+        };
+        let count = crate::draw_weighted_index(&mut self.rng, &phase.arrivals_pmf);
+        self.arrivals_pending = count as u32;
+        for _ in 0..count {
+            let j = self.auto_spawned;
+            self.auto_spawned += 1;
+            let cc = match &mut self.pool {
+                None => auto_command(j),
+                Some(pool) => {
+                    let (client, sn) = pool.take(&mut self.rng, round);
+                    ClientCommand {
+                        client,
+                        sn,
+                        op: AUTO_OP_BASE + j,
+                    }
+                }
+            };
+            self.trackers.push(CommandTracker {
+                client: cc.client,
+                op: cc.op,
+                cc,
+                injection_round: round,
+                target: None,
+                auto: true,
+                delivered_round: None,
+                all_logs_round: None,
+                prefix_fixed_round: None,
+                committed_ack_round: None,
+                executed_round: None,
+                fixed_prefix: None,
+                spread: Vec::new(),
+                spread_points: 0,
+                attempts: Vec::new(),
+                amp_receivers: Vec::new(),
+                canon_cursor: None,
+            });
+        }
+        if count > 0 {
+            self.client_order = (0..self.trackers.len()).collect();
+            self.client_order.sort_by_key(|&i| self.trackers[i].client);
+        }
+    }
+
+    /// Fresh-style step: arrivals, then this round's blocked set, then the round.
+    pub fn step_sampled(&mut self, count: usize) -> SmrStepStatus {
+        self.assert_not_failed("sample and step");
+        if !self.traffic.is_empty() && self.arrivals_drawn_for != Some(self.round + 1) {
+            self.draw_arrivals();
+        }
+        let mask = sample_blocked(&mut self.rng, self.n, count);
+        self.step_masked(&mask)
+    }
+
+    pub fn step_fraction(&mut self, fraction: f64) -> SmrStepStatus {
+        self.step_sampled(self.blocked_count(fraction))
+    }
+
+    /// Largest blocked-set size whose realized fraction stays within budget.
+    pub fn blocked_count(&self, fraction: f64) -> usize {
+        fraction_count(fraction, self.n)
+    }
+
+    pub fn sample_mask(&mut self, count: usize) -> Vec<bool> {
+        self.assert_not_failed("sample a mask");
+        self.assert_arrivals_before_masks();
+        sample_blocked(&mut self.rng, self.n, count)
+    }
+
+    pub fn adjust_sticky(&mut self, mask: &mut [bool], count: usize) {
+        self.assert_not_failed("adjust a sticky mask");
+        self.assert_arrivals_before_masks();
+        adjust_sticky_mask(&mut self.rng, mask, count, self.n);
+    }
+
+    /// The batch driver's sticky round mask: adjust `sticky` to `count`, then union a background sample.
+    pub fn sticky_round_mask(
+        &mut self,
+        sticky: &mut [bool],
+        count: usize,
+        background_count: usize,
+    ) -> Vec<bool> {
+        self.assert_not_failed("draw a sticky mask");
+        self.assert_arrivals_before_masks();
+        sticky_with_background(&mut self.rng, sticky, count, background_count, self.n)
+    }
+
+    fn assert_arrivals_before_masks(&self) {
+        assert!(
+            self.traffic.is_empty() || self.arrivals_drawn_for == Some(self.round + 1),
+            "traffic configured: draw_arrivals must precede mask draws for round {}",
+            self.round + 1
+        );
+    }
+
+    /// Live pmf edit: lands from the next round and replaces every later phase.
+    pub fn set_traffic_pmf(&mut self, pmf: Vec<f64>) -> Result<(), String> {
+        if self.failure.is_some() {
+            return Err("recovery run failed; traffic cannot be changed".into());
+        }
+        validate_pmf(&pmf)?;
+        let from_round = self.round + 1;
+        self.traffic.retain(|p| p.from_round < from_round);
+        self.traffic.push(TrafficPhase {
+            from_round,
+            arrivals_pmf: pmf,
+        });
+        Ok(())
+    }
+
+    /// The recorded phase list (ctor phases + live edits), the replay export source.
+    pub fn traffic_phases(&self) -> &[TrafficPhase] {
+        &self.traffic
+    }
+
+    /// Manual commands only; a replay regenerates traffic arrivals from phases + seed.
+    pub fn manual_injections(&self) -> Vec<Injection> {
+        self.trackers
+            .iter()
+            .filter(|t| !t.auto)
+            .map(|t| Injection {
+                round: t.injection_round,
+                client: t.client,
+                op: t.op,
+                target: t.target,
+            })
+            .collect()
+    }
+
+    pub(crate) fn rng_mut(&mut self) -> &mut ChaCha12Rng {
+        self.assert_not_failed("draw from the RNG");
+        &mut self.rng
+    }
+
+    fn assert_not_failed(&self, action: &str) {
+        assert!(
+            self.failure.is_none(),
+            "recovery run failed; cannot {action}"
+        );
+    }
+
+    pub fn round(&self) -> usize {
+        self.round
+    }
+
+    pub fn failure(&self) -> Option<&RecoveryFailure> {
+        self.failure.as_ref()
+    }
+
+    /// Register a live command; it lands next round, since stamping this round would break replay.
+    pub fn inject(&mut self, client: u32, op: u64, target: Option<u32>) -> Result<usize, String> {
+        if self.failure.is_some() {
+            return Err("recovery run failed; commands cannot be injected".into());
+        }
+        let duplicate = self.trackers.iter().any(|t| t.op == op);
+        validate_injection(client, op, target, self.n, duplicate)?;
+        let round = self.round + 1;
+        let (mut new_tracker, _) = trackers_for(&[Injection {
+            round,
+            client,
+            op,
+            target,
+        }]);
+        let mut tracker = new_tracker.pop().expect("one tracker");
+        tracker.cc.sn = 1 + self
+            .trackers
+            .iter()
+            .filter(|t| !t.auto && t.client == client)
+            .count() as u64;
+        self.trackers.push(tracker);
+        self.client_order = (0..self.trackers.len()).collect();
+        self.client_order.sort_by_key(|&i| self.trackers[i].client);
+        Ok(round)
+    }
+
+    /// Every command this session knows, in tracker order, for replay export.
+    pub fn injections(&self) -> Vec<Injection> {
+        self.trackers
+            .iter()
+            .map(|t| Injection {
+                round: t.injection_round,
+                client: t.client,
+                op: t.op,
+                target: t.target,
+            })
+            .collect()
+    }
+
+    /// Step under a precomputed mask; callers must stop on `dead` or diverge from batch replays.
+    pub fn step_masked(&mut self, mask: &[bool]) -> SmrStepStatus {
+        if let Some(status) = &self.failed_status {
+            return status.clone();
+        }
+        assert!(
+            self.traffic.is_empty() || self.arrivals_drawn_for == Some(self.round + 1),
+            "traffic configured but draw_arrivals not called for round {}",
+            self.round + 1
+        );
+        self.arrivals_drawn_for = None;
+        self.round += 1;
+        let status = match &self.nodes {
+            SmrNodes::Ext(_) => self.step_ext(mask),
+            SmrNodes::Comp(_) => self.step_comp(mask),
+            SmrNodes::Rec(_) => self.step_rec(mask),
+        };
+        self.tally_repeat_skips();
+        if let SmrNodes::Rec(nodes) = &self.nodes {
+            let stale = nodes.iter().map(RecoveryNode::stale_checkpoint);
+            self.boundary_skips.observe(stale, self.round);
+        }
+        status
+    }
+
+    fn tally_repeat_skips(&mut self) {
+        let total = match &self.nodes {
+            SmrNodes::Ext(_) => 0,
+            SmrNodes::Comp(nodes) => nodes.iter().map(CompactNode::repeat_skips).sum(),
+            SmrNodes::Rec(nodes) => nodes.iter().map(RecoveryNode::repeat_skips).sum(),
+        };
+        if total > self.repeat_skips && self.first_repeat_skip_round.is_none() {
+            self.first_repeat_skip_round = Some(self.round);
+        }
+        self.repeat_skips = total;
+    }
+
+    /// Per-node executed sequences (compact only).
+    pub fn executed_seqs(&self) -> Vec<Vec<Entry>> {
+        self.assert_not_failed("read live executed sequences");
+        match &self.nodes {
+            SmrNodes::Comp(nodes) => nodes
+                .iter()
+                .map(|nd| nd.shared_state().untruncated().to_vec())
+                .collect(),
+            SmrNodes::Rec(nodes) => nodes
+                .iter()
+                .map(|nd| nd.shared_state().untruncated().to_vec())
+                .collect(),
+            SmrNodes::Ext(_) => Vec::new(),
+        }
+    }
+
+    /// One node's state; unlike [`Self::executed_entries`] it does not panic on a truncated state.
+    pub fn node_state(&self, node: usize) -> Option<&protocol::compact::SharedState> {
+        self.assert_not_failed("read live node state");
+        match &self.nodes {
+            SmrNodes::Comp(nodes) => Some(nodes[node].shared_state()),
+            SmrNodes::Rec(nodes) => Some(nodes[node].shared_state()),
+            SmrNodes::Ext(_) => None,
+        }
+    }
+
+    /// One node's executed prefix, uncloned; panics on a truncated state.
+    pub fn executed_entries(&self, node: usize) -> Option<&ExecSeq> {
+        self.assert_not_failed("read live executed entries");
+        match &self.nodes {
+            SmrNodes::Comp(nodes) => Some(nodes[node].shared_state().untruncated()),
+            SmrNodes::Rec(nodes) => Some(nodes[node].shared_state().untruncated()),
+            SmrNodes::Ext(_) => None,
+        }
+    }
+
+    /// The canonical §6 committed sequence: the longest executed one, ties by lowest node id.
+    pub fn committed_entries(&self) -> Option<Vec<Entry>> {
+        self.assert_not_failed("read live committed entries");
+        let SmrNodes::Rec(nodes) = &self.nodes else {
+            return None;
+        };
+        Some(
+            nodes
+                .iter()
+                .map(|nd| nd.shared_state().untruncated())
+                .enumerate()
+                .max_by_key(|(i, executed)| (executed.len(), std::cmp::Reverse(*i)))
+                .map(|(_, executed)| executed.to_vec())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// One node's checkpoint-resident §5 certificate state (recovery with certs only).
+    pub fn checkpoint_certs(&self, node: usize) -> Option<&ServerCertState> {
+        self.assert_not_failed("read live checkpoint certificates");
+        let SmrNodes::Rec(nodes) = &self.nodes else {
+            return None;
+        };
+        nodes.get(node)?.checkpoint().certs.as_ref()
+    }
+
+    /// One recovery node, read-only; unlike [`Self::rec_node_detail`] safe on a lean run.
+    pub fn recovery_node(&self, node: usize) -> Option<&RecoveryNode> {
+        self.assert_not_failed("read a live recovery node");
+        let SmrNodes::Rec(nodes) = &self.nodes else {
+            return None;
+        };
+        nodes.get(node)
+    }
+
+    pub fn rec_node_detail(&self, node: usize) -> Option<RecNodeDetail> {
+        self.assert_not_failed("read live recovery node detail");
+        let SmrNodes::Rec(nodes) = &self.nodes else {
+            return None;
+        };
+        let nd = nodes.get(node)?;
+        let checkpoint = nd.checkpoint();
+        Some(RecNodeDetail {
+            node: node as u32,
+            r: engine::engine_rec::r_code(nd.reset_state()),
+            log_len: nd.log_seq().map(|l| l.len() as u32),
+            executed_len: nd.shared_state().logical_len() as u32,
+            checkpoint_window: checkpoint.w,
+            checkpoint_p_len: checkpoint.p.as_ref().map(|p| p.len() as u32),
+            s_hash: observe::detail::hash_hex(&nd.shared_state().untruncated().to_vec()),
+            checkpoint_s_hash: observe::detail::hash_hex(&checkpoint.s.untruncated().to_vec()),
+        })
+    }
+
+    pub fn compact_logs(&self) -> Vec<Option<Vec<protocol::compact::Timed>>> {
+        self.assert_not_failed("read live compact logs");
+        match &self.nodes {
+            SmrNodes::Comp(nodes) => nodes.iter().map(CompactNode::log_entries).collect(),
+            SmrNodes::Ext(_) | SmrNodes::Rec(_) => Vec::new(),
+        }
+    }
+
+    /// The report's `safety_ok` latch without rebuilding the report.
+    pub fn safety_ok(&self) -> bool {
+        self.safety_ok
+    }
+
+    /// False once a command was executed twice (compact or recovery); always true for extended.
+    pub fn exec_unique_ok(&self) -> bool {
+        self.exec_dup.tripped_round().is_none()
+    }
+
+    /// The report so far — non-consuming, callable mid-session.
+    pub fn report(&self) -> SmrReport {
+        let terminal = if let Some(failure) = &self.failure {
+            SmrTerminal::Failed {
+                attempted_round: failure.attempted_round,
+                completed_round: failure.completed_round,
+                observed_round: failure.observed_round,
+                phase: failure.phase,
+            }
+        } else {
+            match self.dead {
+                Some(round) => SmrTerminal::Dead { round },
+                None => SmrTerminal::Ran { rounds: self.round },
+            }
+        };
+        let mut commands: Vec<CommandReport> = self
+            .trackers
+            .iter()
+            .map(|t| t.report(terminal, self.observe_spread))
+            .collect();
+        // (injection_round, client) is total and shared by a live session and its replay.
+        commands.sort_by_key(|c| (c.injection_round, c.client));
+        SmrReport {
+            metrics: self.metrics.clone(),
+            commands,
+            terminal,
+            safety_ok: self.safety_ok,
+            exec_dup_round: self.exec_dup.tripped_round(),
+            repeat_skips: self.repeat_skips,
+            first_repeat_skip_round: self.first_repeat_skip_round,
+            boundary_skip_events: self.boundary_skips.events(),
+            first_boundary_skip_round: self.boundary_skips.first_round(),
+            last_boundary_skip_round: self.boundary_skips.last_round(),
+            max_rejoin_rounds: self.boundary_skips.max_rejoin_rounds(),
+            unrejoined_nodes: self.boundary_skips.unrejoined(),
+            failure: self.failure.clone(),
+            recovery: self.rec.as_ref().map(|r| RecoveryReport {
+                fork_ok: r.fork_ok,
+                rounds: r.rows.clone(),
+            }),
+            pool_peak_in_flight: self.pool.as_ref().map(ClientPool::peak_in_flight),
+            spill_path: self
+                .spill
+                .as_ref()
+                .map(|s| s.path().to_string_lossy().into_owned()),
+        }
+    }
+
+    pub(crate) fn finish_spill(&mut self) {
+        if let Some(spill) = &mut self.spill {
+            spill.finish().expect("spill trailer write failed");
+        }
+    }
+}
+
+fn blocked_ids(mask: &[bool]) -> Vec<u32> {
+    mask.iter()
+        .enumerate()
+        .filter_map(|(i, &b)| b.then_some(i as u32))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests;

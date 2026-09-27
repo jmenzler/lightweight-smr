@@ -1,0 +1,17 @@
+mod compact_exec_dup;
+mod harness;
+mod merge_policy_spec;
+mod observer_inertness;
+mod partition_determinism;
+mod recovery_skip_boundary;
+mod smr_analysis;
+mod smr_commands;
+mod smr_halt_on_violation;
+mod smr_lean_report;
+mod smr_metrics_cli;
+mod smr_runlog;
+mod smr_spec;
+mod smr_sweep_grid;
+mod spec;
+mod sweep_grid;
+mod trace_counts;
